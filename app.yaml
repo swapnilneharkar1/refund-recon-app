@@ -1,0 +1,15 @@
+# For deploying as a Databricks App. The app's own service principal is injected
+# automatically, so DATABRICKS_AUTH_TYPE=default. Grant that SP access to the
+# warehouse + catalog/schema (see README). The warehouse is added as an app resource named "sql-warehouse".
+command: ["streamlit", "run", "app.py", "--server.headless", "true"]
+env:
+  - name: DATABRICKS_AUTH_TYPE
+    value: "default"
+  - name: DATABRICKS_WAREHOUSE_ID
+    valueFrom: "sql-warehouse"
+  - name: RECON_CATALOG
+    value: "main"
+  - name: RECON_SCHEMA
+    value: "refund_recon"
+  - name: RECON_VOLUME
+    value: "recon_uploads"

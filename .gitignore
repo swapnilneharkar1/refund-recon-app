@@ -1,0 +1,5 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.env
+sample_data/sample_report.xlsx
