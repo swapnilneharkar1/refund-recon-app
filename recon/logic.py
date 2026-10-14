@@ -39,7 +39,6 @@ UNMATCHED_CODES = {4, 5, 9, 10}
 class Options:
     tolerance: float = 0.0          # |Finance - OPS| <= tolerance counts as Exact Match
     penal_agg: str = "SUM"          # how repeated rows for one key are combined for penal amounts: SUM or MAX
-    per_run_tables: bool = False    # suffix table names with the run id instead of replacing
     table_prefix: str = "bp_refund"
 
 
@@ -58,14 +57,12 @@ def _case(codes: dict[int, str], col: str = "REMARK_CODE") -> str:
     return f"CASE {col} {whens} END"
 
 
-def _recon_sql(out: str, agg_ops: str, agg_fin: str, amt: str, codes: list[int],
+def _recon_sql(agg_ops: str, agg_fin: str, amt: str, codes: list[int],
                remarks: dict[int, str], tol: float, extra_o: list[str], extra_f: list[str]) -> str:
     exact, less, greater, fin_only, ops_only = codes
     extra = ",\n        ".join([f"o.{c} AS {c}_OPS" for c in extra_o] + [f"f.{c} AS {c}_FIN" for c in extra_f])
     extra = (",\n        " + extra) if extra else ""
-    return f"""
-CREATE OR REPLACE TABLE {out} AS
-WITH o AS (SELECT * FROM {agg_ops} WHERE COALESCE({amt}, 0) <> 0),
+    return f"""WITH o AS (SELECT * FROM {agg_ops} WHERE COALESCE({amt}, 0) <> 0),
      f AS (SELECT * FROM {agg_fin} WHERE COALESCE({amt}, 0) <> 0),
      j AS (
   SELECT COALESCE(f.REC_KEY, o.REC_KEY)           AS REC_KEY,
@@ -98,26 +95,29 @@ FROM c
 
 
 def run_pipeline(backend, ops_df: pd.DataFrame, fin_df: pd.DataFrame, opt: Options,
-                 ops_name: str = "", fin_name: str = "",
+                 ops_name: str = "", fin_name: str = "", run_by: str | None = None,
                  progress: Callable[[str], None] = lambda m: None) -> RunResult:
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
-    sfx = f"_{run_id}" if opt.per_run_tables else ""
     p = opt.table_prefix
     names = {
-        "raw_ops": f"{p}_ops_raw{sfx}",
-        "raw_fin": f"{p}_finance_raw{sfx}",
-        "agg_ops": f"{p}_ops_by_lan_sch{sfx}",
-        "agg_fin": f"{p}_finance_by_lan_sch{sfx}",
-        "bounce": f"{p}_bounce_recon{sfx}",
-        "penal": f"{p}_penal_recon{sfx}",
+        "raw_ops": f"{p}_ops_raw",
+        "raw_fin": f"{p}_finance_raw",
+        "agg_ops": f"{p}_ops_by_lan_sch",
+        "agg_fin": f"{p}_finance_by_lan_sch",
+        "bounce": f"{p}_bounce_recon",
+        "penal": f"{p}_penal_recon",
         "log": f"{p}_run_log",
     }
     t = {k: backend.fqn(v) for k, v in names.items()}
     agg = "MAX" if opt.penal_agg.upper() == "MAX" else "SUM"
     str_agg = backend.dialect["str_agg"]
 
-    progress("Preparing schema")
-    backend.ensure_schema()
+    progress("Dropping previous run's tables")
+    for k in ("bounce", "penal", "agg_ops", "agg_fin", "raw_ops", "raw_fin"):
+        backend.drop_table(names[k])
+    notice = backend.prepare_staging()
+    if notice:
+        progress("⚠ " + notice)
 
     progress(f"Uploading OPS data ({len(ops_df):,} rows) → {names['raw_ops']}")
     backend.load_dataframe(ops_df, names["raw_ops"], run_id)
@@ -128,8 +128,7 @@ def run_pipeline(backend, ops_df: pd.DataFrame, fin_df: pd.DataFrame, opt: Optio
     amt = lambda f, c: f"CAST(ROUND({f}({c}), 2) AS DECIMAL(18,2))"  # noqa: E731
 
     progress("Aggregating to LAN + SCH date level")
-    backend.execute(f"""
-CREATE OR REPLACE TABLE {t['agg_ops']} AS
+    backend.recreate_table(names["agg_ops"], f"""
 SELECT {key} AS REC_KEY, FINREFERENCE, SCHDATE,
        MAX(NPA_STAGEID)                          AS NPA_STAGEID,
        {amt('SUM', 'BCC_ADVISEAMOUNT')}          AS BOUNCE_AMT,
@@ -140,8 +139,7 @@ SELECT {key} AS REC_KEY, FINREFERENCE, SCHDATE,
 FROM {t['raw_ops']}
 WHERE FINREFERENCE IS NOT NULL
 GROUP BY FINREFERENCE, SCHDATE""")
-    backend.execute(f"""
-CREATE OR REPLACE TABLE {t['agg_fin']} AS
+    backend.recreate_table(names["agg_fin"], f"""
 SELECT {key} AS REC_KEY, FINREFERENCE, SCHDATE,
        MAX(NPA_STAGEID)                          AS NPA_STAGEID,
        MAX(PPG)                                  AS PPG,
@@ -158,11 +156,11 @@ WHERE FINREFERENCE IS NOT NULL
 GROUP BY FINREFERENCE, SCHDATE""")
 
     progress("Running Bounce charges reconciliation (remarks 1–5)")
-    backend.execute(_recon_sql(t["bounce"], t["agg_ops"], t["agg_fin"], "BOUNCE_AMT",
+    backend.recreate_table(names["bounce"], _recon_sql(t["agg_ops"], t["agg_fin"], "BOUNCE_AMT",
                                [1, 2, 3, 4, 5], BOUNCE_REMARKS, opt.tolerance,
                                extra_o=["ROW_COUNT"], extra_f=["ADVISEIDS", "ROW_COUNT"]))
     progress("Running Penal charges reconciliation (remarks 6–10)")
-    backend.execute(_recon_sql(t["penal"], t["agg_ops"], t["agg_fin"], "PENAL_AMT",
+    backend.recreate_table(names["penal"], _recon_sql(t["agg_ops"], t["agg_fin"], "PENAL_AMT",
                                [6, 7, 8, 9, 10], PENAL_REMARKS, opt.tolerance,
                                extra_o=["PENAL_WAIVED", "PENAL_PAID"],
                                extra_f=["PENAL_WAIVED", "PENAL_PAID"]))
@@ -197,7 +195,7 @@ SELECT (SELECT COUNT(*) FROM {t['agg_ops']}) AS OPS_KEYS,
         "ops_repeated_keys": int(keys["OPS_REPEATED_KEYS"]),
         "fin_repeated_keys": int(keys["FIN_REPEATED_KEYS"]),
         "bounce_cases": len(bounce), "penal_cases": len(penal),
-        "user": backend.whoami(),
+        "user": run_by or backend.whoami(),
     }
 
     progress("Writing run log")

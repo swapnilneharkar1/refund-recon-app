@@ -1,15 +1,30 @@
-# For deploying as a Databricks App. The app's own service principal is injected
-# automatically, so DATABRICKS_AUTH_TYPE=default. Grant that SP access to the
-# warehouse + catalog/schema (see README). The warehouse is added as an app resource named "sql-warehouse".
-command: ["streamlit", "run", "app.py", "--server.headless", "true"]
+# Databricks App definition.
+# Tables are created in bfl_std_lake.financerpa (dropped and recreated on every run).
+# Add your SQL warehouse to the app as a resource with key "sql-warehouse" (Can use).
+command: ["streamlit", "run", "app.py"]
 env:
+  # The app signs in as its own service principal (injected by Databricks), no secret needed.
   - name: DATABRICKS_AUTH_TYPE
     value: "default"
   - name: DATABRICKS_WAREHOUSE_ID
     valueFrom: "sql-warehouse"
   - name: RECON_CATALOG
-    value: "main"
+    value: "bfl_std_lake"
   - name: RECON_SCHEMA
-    value: "refund_recon"
+    value: "financerpa"
   - name: RECON_VOLUME
     value: "recon_uploads"
+  - name: RECON_TABLE_PREFIX
+    value: "bp_refund"
+
+  # --- Alternative: run as RPADLAKEFLOW-PROD instead of the app's own principal ---
+  # 1) store its client secret in a secret scope, 2) add that secret to the app as a
+  #    resource with key "sp-secret", 3) replace the DATABRICKS_AUTH_TYPE entry above with:
+  # - name: DATABRICKS_AUTH_TYPE
+  #   value: "azure"
+  # - name: ARM_CLIENT_ID
+  #   value: "6fb42e7e-346b-4c3b-b640-78138109275f"
+  # - name: ARM_TENANT_ID
+  #   value: "710de1d3-2901-4647-89e7-3b01f1c2806d"
+  # - name: ARM_CLIENT_SECRET
+  #   valueFrom: "sp-secret"

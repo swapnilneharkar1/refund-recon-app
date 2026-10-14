@@ -31,45 +31,33 @@ st.markdown("""
 # --------------------------------------------------------------------------- sidebar
 base = Settings.load()
 
-with st.sidebar:
-    st.header("Settings")
-    mode = st.radio("Run against", ["Databricks", "Local test (no Databricks)"],
-                    help="Local test runs the identical logic in an in-memory DuckDB database, "
-                         "useful for checking files before a production run.")
-    use_dbx = mode == "Databricks"
+settings = base
+missing = settings.missing_for_databricks()
+TARGET = f"{settings.catalog}.{settings.schema}"
+P = settings.table_prefix
+TABLE_LIST = [f"{P}_finance_raw", f"{P}_ops_raw", f"{P}_finance_by_lan_sch", f"{P}_ops_by_lan_sch",
+              f"{P}_bounce_recon", f"{P}_penal_recon"]
 
-    if use_dbx:
-        st.caption("Connection (from secrets / environment)")
-        missing = base.missing_for_databricks()
-        st.text(f"Host      : {base.host or '—'}\n"
-                f"Warehouse : {base.http_path or '—'}\n"
-                f"Auth      : {base.auth_type}\n"
-                f"SP id     : {(base.client_id or '—')[:8]}…")
-        if missing:
-            st.error("Missing settings: " + ", ".join(missing) +
-                     ". Add them to `.streamlit/secrets.toml` or environment variables.")
-        catalog = st.text_input("Catalog", base.catalog)
-        schema = st.text_input("Schema", base.schema)
-        volume = st.text_input("Staging volume", base.volume or "",
-                               help="Unity Catalog volume used to stage uploads (fast). "
-                                    "Leave blank to insert rows directly (slower, fine for small files).")
-        settings = replace(base, catalog=catalog.strip(), schema=schema.strip(),
-                           volume=volume.strip() or None)
-        if st.button("Test connection", width="stretch", disabled=bool(missing)):
-            try:
-                from recon.backends import DatabricksBackend
-                b = DatabricksBackend(settings)
-                who = b.whoami()
-                b.close()
-                st.success(f"Connected as {who}")
-            except Exception as e:  # noqa: BLE001
-                st.error(f"Connection failed: {e}")
-    else:
-        settings, missing = base, []
+with st.sidebar:
+    st.header("Databricks")
+    st.markdown(f"**Target:** `{TARGET}`")
+    st.caption("Every run drops these tables and recreates them from the uploaded files:")
+    st.markdown("\n".join(f"- `{t}`" for t in TABLE_LIST))
+    st.caption(f"Run history is kept in `{P}_run_log`.")
+    if missing:
+        st.error("Missing settings: " + ", ".join(missing) + ". Check app.yaml / the app's resources.")
+    if st.button("Test connection", width="stretch", disabled=bool(missing)):
+        try:
+            from recon.backends import DatabricksBackend
+            b = DatabricksBackend(settings)
+            who = b.whoami()
+            b.close()
+            st.success(f"Connected as {who}")
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Connection failed: {e}")
 
     st.divider()
     st.caption("Reconciliation options")
-    prefix = st.text_input("Table name prefix", base.table_prefix)
     tolerance = st.number_input("Match tolerance (₹)", min_value=0.0, value=0.0, step=0.5,
                                 help="Differences up to this amount are treated as Exact Match.")
     penal_agg = st.selectbox(
@@ -77,13 +65,20 @@ with st.sidebar:
         ["SUM", "MAX"],
         help="SUM adds the rows up. Choose MAX if the file repeats the same penal total on every "
              "bounce-advise row of that LAN + SCH date.")
-    per_run = st.checkbox("Keep separate tables per run", value=False,
-                          help="Adds the run id to table names instead of replacing the previous run's tables.")
 
 # --------------------------------------------------------------------------- header
 st.title("Bounce & Penal Charges Refund – OPS vs Finance Reconciliation")
 st.caption("Cases where unadjusted excess ≥ EMI outstanding on the due date. "
            "Compared at FINREFERENCE + SCH date level; remarks per BRD codes 1–10.")
+
+
+def current_user() -> str | None:
+    """Logged-in user's email when running as a Databricks App (its proxy adds this header)."""
+    try:
+        h = st.context.headers
+        return h.get("X-Forwarded-Email") or h.get("X-Forwarded-Preferred-Username")
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @st.cache_data(show_spinner=False)
@@ -176,23 +171,18 @@ if not ready:
 
 # --------------------------------------------------------------------------- run
 if go:
-    opt = Options(tolerance=float(tolerance), penal_agg=penal_agg, per_run_tables=per_run,
-                  table_prefix=ingest.norm_header(prefix).lower())
+    opt = Options(tolerance=float(tolerance), penal_agg=penal_agg, table_prefix=P)
     backend = None
     with st.status("Running reconciliation…", expanded=True) as status:
         try:
-            if use_dbx:
-                from recon.backends import DatabricksBackend
-                status.write("Connecting to Databricks SQL warehouse")
-                backend = DatabricksBackend(settings)
-            else:
-                from recon.backends import LocalBackend
-                backend = LocalBackend()
+            from recon.backends import DatabricksBackend
+            status.write("Connecting to Databricks SQL warehouse")
+            backend = DatabricksBackend(replace(settings))
             result = run_pipeline(backend, ops_prep.df, fin_prep.df, opt,
-                                  ops_name=ops_up.name, fin_name=fin_up.name,
+                                  ops_name=ops_up.name, fin_name=fin_up.name, run_by=current_user(),
                                   progress=status.write)
             status.write("Building the 3 Excel reports")
-            where = (f"{settings.catalog}.{settings.schema}" if use_dbx else "local DuckDB (not saved)")
+            where = TARGET
             xlsx = reports.build_reports(result, ops_up.name, fin_up.name, {
                 "Ran against": where,
                 "Match tolerance (₹)": tolerance,

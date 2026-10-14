@@ -1,77 +1,57 @@
-# Bounce & Penal Charges Refund – OPS vs Finance Reconciliation (Streamlit + Databricks)
+# Bounce & Penal Charges Refund – OPS vs Finance Reconciliation (Databricks App)
 
 Implements the BRD *"Refund of Bounce and Penal for Excess available cases"*.
+Runs entirely inside Databricks: the app on **Databricks Apps**, all tables and logic on the **SQL warehouse**
+in **`bfl_std_lake.financerpa`**.
 
-User flow: upload **1. Finance** file and **2. OPS** file → click **Execute** → the app
-loads both into Databricks tables, runs the reconciliation as SQL on the warehouse,
-and shows/downloads the reports.
-
-## What it does
-
-| Step | Where | Detail |
-|---|---|---|
-| Read & clean | app | Columns are found **by name, not position**: column order, extra columns and missing optional columns are all fine (extra columns are kept in the raw table). If a header is renamed, the **Column mapping** panel lets the user point the field at the right column. A file put in the wrong upload box is detected. Column names matched case/space-insensitively (`NPA Stage` → `NPA_STAGEID`). LANs kept as text (leading zeros safe). Dates: Excel dates, `yyyy-mm-dd`, or day-first `dd-mm-yyyy`. Amounts: commas/₹ stripped. |
-| Load | Databricks | `<prefix>_ops_raw`, `<prefix>_finance_raw` (all uploaded columns kept for audit). Staged as parquet in a UC volume, then `CREATE OR REPLACE TABLE … AS SELECT`. |
-| Aggregate | Databricks | One row per **FINREFERENCE + SCHDATE** (`REC_KEY`, BRD §2.3) → `<prefix>_ops_by_lan_sch`, `<prefix>_finance_by_lan_sch`. |
-| Bounce recon | Databricks | `BCC_ADVISEAMOUNT` (OPS) vs `ADVISEAMOUNT` (Finance) → remarks 1–5 → `<prefix>_bounce_recon` |
-| Penal recon | Databricks | `TOTPENALTYAMT_LEVIED` (OPS) vs `TOTPENALTYAMT` (Finance) → remarks 6–10 → `<prefix>_penal_recon` |
-| Log | Databricks | one row per run in `<prefix>_run_log` (who, when, files, counts) |
-| Reports | app | Three separate Excel downloads (BRD §5): **Primary Reconciliation Report** (all cases), **Exception Report – Amount Differences** (remarks 2,3,7,8), **Unmatched Records Report** (4,5,9,10). Each has a Summary sheet plus separate Bounce and Penal sheets. CSV per tab too. |
+## What happens when the user clicks Execute
+1. **Drop** the previous run's tables.
+2. **Create** `bp_refund_finance_raw` and `bp_refund_ops_raw` from the uploaded files
+   (file staged as parquet in volume `bfl_std_lake.financerpa.recon_uploads`, then deleted;
+   if the volume can't be used, rows are inserted directly).
+3. **Create** `bp_refund_finance_by_lan_sch` / `bp_refund_ops_by_lan_sch` – one row per FINREFERENCE + SCHDATE.
+4. **Create** `bp_refund_bounce_recon` – `ADVISEAMOUNT` (Finance) vs `BCC_ADVISEAMOUNT` (OPS), remarks 1–5.
+5. **Create** `bp_refund_penal_recon` – `TOTPENALTYAMT` (Finance) vs `TOTPENALTYAMT_LEVIED` (OPS), remarks 6–10.
+6. Append one row to `bp_refund_run_log` (who, when, files, counts) – the only table kept across runs.
+7. Three Excel downloads: **Primary Reconciliation Report**, **Exception Report – Amount Differences**
+   (2, 3, 7, 8), **Unmatched Records Report** (4, 5, 9, 10). Each has a Summary sheet + Bounce and Penal sheets.
 
 Remarks: 1/6 Exact Match · 2/7 Finance < OPS · 3/8 Finance > OPS · 4/9 only in Finance · 5/10 only in OPS.
 `Difference = Amount (Ops) − Amount (Finance)`.
 
-### Interpretation choices (please confirm with the business)
-1. **"Exists in file"** for a charge type means the LAN+SCH date has a **non-zero** amount for that charge.
-   So a key with a bounce amount but zero penal appears only in the bounce recon.
-2. **Repeated LAN+SCH date rows**: bounce advise amounts are **summed** (several advises per date).
-   Penal amounts are summed by default; switch the sidebar option to **MAX** if Finance repeats the
-   same penal total on every advise row.
-3. The excess ≥ EMI O/s eligibility (Regular via LVD, other stages via Ops data) is assumed to be
-   **already applied** in both uploaded computation files — the BRD's mandatory fields carry no
-   excess/EMI columns. If you want the app to apply it, add those columns and the rule can go into `logic.py`.
-4. `NPA_STAGEID` shown is Finance's, falling back to OPS'; OPS' own stage is kept in `NPA_STAGE_OPS`.
+**Input files** – 1. Finance, 2. OPS (.xlsx or .csv). Columns are found by name, so order / extra / missing
+optional columns don't matter; renamed headers can be mapped in the **Column mapping** panel.
 
-## Setup
+### Interpretation choices (confirm with the business)
+1. A LAN + SCH date is "in" a file for a charge type when its amount for that charge is non-zero.
+2. Repeated LAN + SCH date rows: bounce amounts summed; penal summed by default (sidebar: switch to MAX
+   if Finance repeats the penal total on every advise row).
+3. Excess ≥ EMI O/s eligibility is assumed already applied in both input files.
 
-```bash
-pip install -r requirements.txt
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # fill in host, warehouse, secret
-streamlit run app.py
-```
-
-Use **Local test** mode in the sidebar to try files without Databricks (`sample_data/` has a set
-that hits all 10 remark codes; `python tests/test_local_run.py` checks them).
-
-### Service principal (RPADLAKEFLOW-PROD) permissions
-The SP authenticates with Entra ID client-credentials (`DATABRICKS_AUTH_TYPE = "azure"`). In Databricks it needs:
-- to be added to the workspace (Admin → Identity → Service principals, using the Application ID)
-- **CAN USE** on the SQL warehouse
-- `USE CATALOG` on the catalog; `USE SCHEMA`, `CREATE TABLE`, `CREATE VOLUME` (or an existing volume with
-  `READ VOLUME`/`WRITE VOLUME`) on the schema — or have an admin pre-create the schema and volume.
-
-```sql
-GRANT USE CATALOG ON CATALOG main TO `6fb42e7e-346b-4c3b-b640-78138109275f`;
-GRANT USE SCHEMA, CREATE TABLE, CREATE VOLUME ON SCHEMA main.refund_recon TO `6fb42e7e-346b-4c3b-b640-78138109275f`;
-GRANT READ VOLUME, WRITE VOLUME ON VOLUME main.refund_recon.recon_uploads TO `6fb42e7e-346b-4c3b-b640-78138109275f`;
-```
-
-No volume? Set `RECON_VOLUME = ""` — rows are inserted in batches instead (fine up to tens of thousands of rows).
-
-### Deploying as a Databricks App (optional)
-`app.yaml` is included. Add the SQL warehouse as an app resource named `sql-warehouse`; the app's own SP is
-used automatically (`DATABRICKS_AUTH_TYPE=default`), so grant the permissions above to that SP instead.
-
-**Never commit `.streamlit/secrets.toml`** (it's in `.gitignore`). In production prefer a secret store
-(Databricks secret scope, Azure Key Vault, or the hosting platform's env vars).
+## Deploy (Databricks Apps)
+1. Workspace → **Create → Git folder** → `https://github.com/swapnilneharkar1/refund-recon-app`.
+2. **Compute → Apps → Create app → Custom app**. Resource: **SQL warehouse** `0e207ff8aa2fb4ba`,
+   permission *Can use*, key **`sql-warehouse`**.
+3. **Deploy** from the Git folder. For updates: pull in the Git folder → Deploy again.
+4. Grant the app's service principal (app page → Authorization) access – run as an admin:
+   ```sql
+   GRANT USE CATALOG ON CATALOG bfl_std_lake TO `<app-sp-application-id>`;
+   GRANT USE SCHEMA, CREATE TABLE, SELECT, MODIFY ON SCHEMA bfl_std_lake.financerpa TO `<app-sp-application-id>`;
+   -- staging volume (recommended for big files):
+   CREATE VOLUME IF NOT EXISTS bfl_std_lake.financerpa.recon_uploads;
+   GRANT READ VOLUME, WRITE VOLUME ON VOLUME bfl_std_lake.financerpa.recon_uploads TO `<app-sp-application-id>`;
+   ```
+   To run as **RPADLAKEFLOW-PROD** instead (if it already has these rights), see the commented block in `app.yaml`.
+5. App page → **Permissions** → give users *Can use*.
 
 ## Layout
 ```
-app.py                 Streamlit UI
-recon/config.py        settings from secrets/env
-recon/ingest.py        file reading, column mapping, cleaning
-recon/backends.py      Databricks (SP auth, volume upload) and local DuckDB backends
-recon/logic.py         reconciliation SQL + remark rules
-recon/reports.py       report shaping + Excel export
-tests/                 sample-data generator + end-to-end check
+app.py              Streamlit UI (Databricks App)
+app.yaml            Databricks App config: target bfl_std_lake.financerpa, warehouse resource
+recon/config.py     settings from app.yaml env
+recon/ingest.py     file reading, column mapping, cleaning
+recon/backends.py   Databricks SQL warehouse: drop/create tables, volume staging
+recon/logic.py      reconciliation SQL + remark rules
+recon/reports.py    the 3 Excel reports
+tests/              sample data + offline test (pip install -r tests/requirements-test.txt; python tests/test_local_run.py)
 ```

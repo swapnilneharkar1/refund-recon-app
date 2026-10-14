@@ -1,0 +1,2 @@
+-r ../requirements.txt
+duckdb>=1.0   # tests only: stands in for the SQL warehouse

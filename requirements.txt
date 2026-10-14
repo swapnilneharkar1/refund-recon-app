@@ -1,8 +1,8 @@
 streamlit>=1.50
-pandas>=2.1
+pandas>=2.2
 openpyxl>=3.1
+python-calamine>=0.2
 xlsxwriter>=3.1
 pyarrow>=14
 databricks-sql-connector>=3.4
 databricks-sdk>=0.30
-duckdb>=1.0          # only for "Local test" mode

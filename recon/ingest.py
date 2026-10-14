@@ -75,7 +75,11 @@ def read_raw(uploaded, sheet: str | None = None) -> pd.DataFrame:
     if name.endswith((".csv", ".txt")):
         return pd.read_csv(data, dtype=str, keep_default_na=False, na_values=[""], encoding_errors="replace")
     if name.endswith((".xlsx", ".xlsm", ".xls")):
-        return pd.read_excel(data, sheet_name=sheet or 0, dtype=str)
+        try:  # calamine is ~10x faster than openpyxl on large workbooks
+            return pd.read_excel(data, sheet_name=sheet or 0, dtype=str, engine="calamine")
+        except ImportError:
+            data.seek(0)
+            return pd.read_excel(data, sheet_name=sheet or 0, dtype=str)
     raise ValueError(f"Unsupported file type: {uploaded.name} (use .xlsx or .csv)")
 
 

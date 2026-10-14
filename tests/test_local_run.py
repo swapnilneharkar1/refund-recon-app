@@ -6,7 +6,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from recon import ingest, reports  # noqa: E402
-from recon.backends import LocalBackend  # noqa: E402
+sys.path.insert(0, str(ROOT / "tests"))
+from local_backend import LocalBackend  # noqa: E402
 from recon.logic import Options, run_pipeline  # noqa: E402
 
 

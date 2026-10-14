@@ -44,6 +44,12 @@ class Settings:
     @classmethod
     def load(cls) -> "Settings":
         host = _get("DATABRICKS_HOST")
+        if not host and (_get("DATABRICKS_AUTH_TYPE") or "").lower() == "default":
+            try:  # Databricks Apps / notebooks: let the SDK find the workspace
+                from databricks.sdk.core import Config
+                host = Config().host
+            except Exception:  # noqa: BLE001
+                host = None
         if host:
             host = host.replace("https://", "").replace("http://", "").strip("/")
         return cls(
@@ -51,11 +57,13 @@ class Settings:
             http_path=_get("DATABRICKS_HTTP_PATH") or (
                 f"/sql/1.0/warehouses/{_get('DATABRICKS_WAREHOUSE_ID')}" if _get("DATABRICKS_WAREHOUSE_ID") else None),
             auth_type=(_get("DATABRICKS_AUTH_TYPE", "azure") or "azure").lower(),
-            client_id=_get("DATABRICKS_CLIENT_ID") or _get("ARM_CLIENT_ID"),
-            client_secret=_get("DATABRICKS_CLIENT_SECRET") or _get("ARM_CLIENT_SECRET"),
-            tenant_id=_get("DATABRICKS_TENANT_ID") or _get("ARM_TENANT_ID"),
-            catalog=_get("RECON_CATALOG", "main") or "main",
-            schema=_get("RECON_SCHEMA", "refund_recon") or "refund_recon",
+            # ARM_* first: inside a Databricks App, DATABRICKS_CLIENT_* belong to the app's own
+            # principal, while ARM_* are used when the app should run as RPADLAKEFLOW-PROD.
+            client_id=_get("ARM_CLIENT_ID") or _get("DATABRICKS_CLIENT_ID"),
+            client_secret=_get("ARM_CLIENT_SECRET") or _get("DATABRICKS_CLIENT_SECRET"),
+            tenant_id=_get("ARM_TENANT_ID") or _get("DATABRICKS_TENANT_ID"),
+            catalog=_get("RECON_CATALOG", "bfl_std_lake") or "bfl_std_lake",
+            schema=_get("RECON_SCHEMA", "financerpa") or "financerpa",
             volume=_get("RECON_VOLUME", "recon_uploads"),
             table_prefix=_get("RECON_TABLE_PREFIX", "bp_refund") or "bp_refund",
         )

@@ -1,10 +1,7 @@
-"""SQL execution backends.
+"""Databricks backend: every table, load and calculation runs on the Databricks SQL warehouse.
 
-DatabricksBackend  - the real thing: SQL warehouse + service principal.
-LocalBackend       - DuckDB in-process, for trying the app / testing logic without Databricks.
-
-Both run the *same* reconciliation SQL (see logic.py); the few functions whose
-names differ between the two engines live in the `dialect` dicts.
+Each run DROPs the previous tables and CREATEs them again from the newly uploaded files.
+(tests/local_backend.py has a DuckDB stand-in used only by the automated tests.)
 """
 from __future__ import annotations
 
@@ -20,11 +17,6 @@ DATABRICKS_DIALECT = {
     "str_agg": lambda col: f"array_join(sort_array(collect_set(CAST({col} AS STRING))), ', ')",
     "now": "current_timestamp()",
     "quote": lambda v: str(v).replace("\\", "\\\\").replace("'", "\\'"),
-}
-DUCKDB_DIALECT = {
-    "str_agg": lambda col: f"string_agg(DISTINCT CAST({col} AS VARCHAR), ', ' ORDER BY CAST({col} AS VARCHAR))",
-    "now": "current_timestamp",
-    "quote": lambda v: str(v).replace("'", "''"),
 }
 
 
@@ -110,10 +102,30 @@ class DatabricksBackend:
     def whoami(self) -> str:
         return str(self.query("SELECT current_user() AS u").iloc[0, 0])
 
-    def ensure_schema(self) -> None:
-        self.execute(f"CREATE SCHEMA IF NOT EXISTS `{self.s.catalog}`.`{self.s.schema}`")
-        if self.s.volume:
-            self.execute(f"CREATE VOLUME IF NOT EXISTS `{self.s.catalog}`.`{self.s.schema}`.`{self.s.volume}`")
+    def prepare_staging(self) -> str | None:
+        """Make sure the staging volume exists. Returns a notice if we had to fall back."""
+        if not self.s.volume:
+            return None
+        cat, sch, vol = self.s.catalog, self.s.schema, self.s.volume
+        try:
+            found = self.query(f"SHOW VOLUMES IN `{cat}`.`{sch}` LIKE '{vol}'")
+            if len(found):
+                return None
+            self.execute(f"CREATE VOLUME IF NOT EXISTS `{cat}`.`{sch}`.`{vol}`")
+            return None
+        except Exception as e:  # noqa: BLE001
+            self.s.volume = None
+            return (f"Staging volume {cat}.{sch}.{vol} not available ({str(e).splitlines()[0][:150]}). "
+                    f"Loading rows directly instead – slower for big files.")
+
+    # ---- table management ----------------------------------------------
+    def drop_table(self, table: str) -> None:
+        self.execute(f"DROP TABLE IF EXISTS {self.fqn(table)}")
+
+    def recreate_table(self, table: str, select_sql: str) -> None:
+        """Drop the previous version of the table, then create it fresh from the SELECT."""
+        self.drop_table(table)
+        self.execute(f"CREATE TABLE {self.fqn(table)} AS\n{select_sql}")
 
     # ---- loading -------------------------------------------------------
     def load_dataframe(self, df: pd.DataFrame, table: str, run_id: str) -> None:
@@ -123,18 +135,26 @@ class DatabricksBackend:
             self._load_via_insert(df, table)
 
     def _load_via_volume(self, df: pd.DataFrame, table: str, run_id: str) -> None:
-        """Fast path: parquet -> UC volume -> CTAS. Handles lakhs of rows easily."""
+        """Fast path: parquet -> UC volume -> CREATE TABLE AS SELECT. Staged file is deleted afterwards."""
         buf = io.BytesIO()
         df.to_parquet(buf, index=False)
         buf.seek(0)
         path = f"/Volumes/{self.s.catalog}/{self.s.schema}/{self.s.volume}/uploads/{run_id}/{table}.parquet"
         self.ws.files.upload(path, buf, overwrite=True)
-        self.execute(f"CREATE OR REPLACE TABLE {self.fqn(table)} AS SELECT * FROM parquet.`{path}`")
+        try:
+            self.recreate_table(table, f"SELECT * FROM parquet.`{path}`")
+        finally:
+            try:
+                self.ws.files.delete(path)
+                self.ws.files.delete_directory(path.rsplit("/", 1)[0])
+            except Exception:  # noqa: BLE001
+                pass
 
-    def _load_via_insert(self, df: pd.DataFrame, table: str, chunk: int = 1000) -> None:
-        """Fallback when no volume is configured: batched INSERT ... VALUES."""
+    def _load_via_insert(self, df: pd.DataFrame, table: str, chunk: int = 2000) -> None:
+        """Fallback when no volume is available: batched INSERT ... VALUES."""
         cols = ", ".join(f"`{c}` {_spark_type(df[c])}" for c in df.columns)
-        self.execute(f"CREATE OR REPLACE TABLE {self.fqn(table)} ({cols})")
+        self.drop_table(table)
+        self.execute(f"CREATE TABLE {self.fqn(table)} ({cols})")
         records = df.astype(object).where(df.notna(), None).itertuples(index=False, name=None)
         batch: list[str] = []
         for rec in records:
@@ -148,44 +168,5 @@ class DatabricksBackend:
     def close(self):
         try:
             self.conn.close()
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
-
-
-class LocalBackend:
-    """DuckDB stand-in so the app (and the logic) can be tried without Databricks."""
-
-    name = "Local test (DuckDB)"
-    dialect = DUCKDB_DIALECT
-
-    def __init__(self, path: str = ":memory:"):
-        import duckdb
-
-        self.con = duckdb.connect(path)
-
-    def fqn(self, table: str) -> str:
-        return f'"{table}"'
-
-    def execute(self, statement: str) -> None:
-        self.con.execute(statement)
-
-    def query(self, statement: str) -> pd.DataFrame:
-        return self.con.execute(statement).df()
-
-    def whoami(self) -> str:
-        return "local-user"
-
-    def ensure_schema(self) -> None:
-        pass
-
-    def load_dataframe(self, df: pd.DataFrame, table: str, run_id: str) -> None:
-        tmp = df.copy()
-        tmp["SCHDATE"] = pd.to_datetime(tmp["SCHDATE"])
-        self.con.register("_incoming", tmp)
-        self.con.execute(
-            f"CREATE OR REPLACE TABLE {self.fqn(table)} AS "
-            f"SELECT * REPLACE (CAST(SCHDATE AS DATE) AS SCHDATE) FROM _incoming")
-        self.con.unregister("_incoming")
-
-    def close(self):
-        self.con.close()
