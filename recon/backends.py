@@ -45,32 +45,113 @@ def _spark_type(series: pd.Series) -> str:
     return "STRING"
 
 
+def build_config(s: Settings, quick: bool = False):
+    """Databricks SDK config for the chosen auth method (shared by SQL + REST calls).
+    quick=True gives up after ~30 s instead of retrying for minutes (used by Test connection)."""
+    from databricks.sdk.core import Config as _Config
+
+    def Config(**kw):  # noqa: N802
+        if quick:
+            kw.update(http_timeout_seconds=20, retry_timeout_seconds=30)
+        return _Config(**kw)
+
+    if s.auth_type == "azure":
+        return Config(host=f"https://{s.host}", azure_client_id=s.client_id,
+                      azure_client_secret=s.client_secret, azure_tenant_id=s.tenant_id,
+                      auth_type="azure-client-secret")
+    if s.auth_type == "databricks":
+        return Config(host=f"https://{s.host}", client_id=s.client_id,
+                      client_secret=s.client_secret, auth_type="oauth-m2m")
+    # "default": e.g. inside a Databricks App, env vars are injected for the app's SP
+    return Config(host=f"https://{s.host}") if s.host else Config()
+
+
+def _err(e: Exception) -> str:
+    """Full error text including wrapped causes (the SQL driver hides the real reason)."""
+    parts, seen = [], set()
+    while e is not None and id(e) not in seen:
+        seen.add(id(e))
+        msg = f"{type(e).__name__}: {e}".strip()
+        ctx = getattr(e, "context", None)
+        if ctx:
+            msg += f" | context: {ctx}"
+        parts.append(msg[:600])
+        e = e.__cause__ or e.__context__
+    return "  ←  ".join(parts)
+
+
+def _hint(text: str) -> str:
+    t = text.lower()
+    if "ip acl" in t or "ip access list" in t or ("source ip" in t and "blocked" in t):
+        return (" → The workspace only accepts connections from approved networks (IP access list). "
+                "Ask the Databricks admin to allow the network this app runs from.")
+    if any(k in t for k in ("timed out", "invalid url 'none'", "max retries", "connectionerror",
+                            "name or service not known", "failed to resolve", "connection refused")):
+        return (" → The app could not reach the Databricks workspace at all. Usually the workspace is "
+                "restricted to the company network (private link / firewall), so a server outside it "
+                "(e.g. Streamlit Cloud) is blocked. Needs IT/Databricks admin to allow it.")
+    if "invalid_client" in t or "client authentication failed" in t or "invalid client secret" in t:
+        return " → The client ID / secret pair was rejected. Check the secret and DATABRICKS_AUTH_TYPE."
+    if "can_use" in t or "permission_denied" in t or "does not have" in t or "not authorized" in t:
+        return " → Signed in, but RPADLAKEFLOW-PROD lacks a permission here (see the message)."
+    return ""
+
+
+def diagnose(s: Settings) -> list[tuple[str, bool, str]]:
+    """Check the connection step by step so the failing step and its real error are visible."""
+    steps: list[tuple[str, bool, str]] = []
+    try:
+        cfg = build_config(s, quick=True)
+        hdr = cfg.authenticate()
+        ok = bool(hdr and hdr.get("Authorization"))
+        steps.append(("1. Get access token", ok, f"auth type '{s.auth_type}'" if ok else "no token returned"))
+        if not ok:
+            return steps
+    except Exception as e:  # noqa: BLE001
+        m = _err(e); steps.append(("1. Get access token", False, m + _hint(m)))
+        return steps
+    try:
+        from databricks.sdk import WorkspaceClient
+        w = WorkspaceClient(config=cfg)
+        me = w.current_user.me()
+        steps.append(("2. Reach workspace", True, f"signed in as {me.display_name or me.user_name}"))
+    except Exception as e:  # noqa: BLE001
+        m = _err(e); steps.append(("2. Reach workspace", False, m + _hint(m)))
+        return steps
+    wid = (s.http_path or "").rstrip("/").split("/")[-1]
+    try:
+        wh = w.warehouses.get(wid)
+        state = getattr(wh.state, "value", wh.state)
+        steps.append(("3. SQL warehouse", True, f"{wh.name} ({wid}) – state {state}"))
+    except Exception as e:  # noqa: BLE001
+        m = _err(e); steps.append(("3. SQL warehouse", False, f"{wid}: {m}{_hint(m)}"))
+    try:
+        b = DatabricksBackend(s)
+        b.query("SELECT 1")
+        b.close()
+        steps.append(("4. Run SQL", True, "SELECT 1 ok"))
+    except Exception as e:  # noqa: BLE001
+        m = _err(e); steps.append(("4. Run SQL", False, m + _hint(m)))
+        return steps
+    try:
+        b = DatabricksBackend(s)
+        b.query(f"SHOW TABLES IN `{s.catalog}`.`{s.schema}` LIKE 'zz_none'")
+        b.close()
+        steps.append((f"5. Access {s.catalog}.{s.schema}", True, "schema visible"))
+    except Exception as e:  # noqa: BLE001
+        m = _err(e); steps.append((f"5. Access {s.catalog}.{s.schema}", False, m + _hint(m)))
+    return steps
+
+
 class DatabricksBackend:
     name = "Databricks"
     dialect = DATABRICKS_DIALECT
 
     def __init__(self, s: Settings):
         from databricks import sql
-        from databricks.sdk.core import Config
 
         self.s = s
-        if s.auth_type == "azure":
-            self.cfg = Config(
-                host=f"https://{s.host}",
-                azure_client_id=s.client_id,
-                azure_client_secret=s.client_secret,
-                azure_tenant_id=s.tenant_id,
-                auth_type="azure-client-secret",
-            )
-        elif s.auth_type == "databricks":
-            self.cfg = Config(
-                host=f"https://{s.host}",
-                client_id=s.client_id,
-                client_secret=s.client_secret,
-                auth_type="oauth-m2m",
-            )
-        else:  # "default": e.g. inside a Databricks App, env vars are injected for the app's SP
-            self.cfg = Config(host=f"https://{s.host}") if s.host else Config()
+        self.cfg = build_config(s)
 
         self.conn = sql.connect(
             server_hostname=s.host or self.cfg.host.replace("https://", ""),
