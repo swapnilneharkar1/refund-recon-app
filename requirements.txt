@@ -1,8 +1,6 @@
-streamlit>=1.50
-pandas>=2.2
-openpyxl>=3.1
-python-calamine>=0.2
-xlsxwriter>=3.1
-pyarrow>=14
-databricks-sql-connector>=3.4
-databricks-sdk>=0.30
+# Most packages (streamlit, pandas, pyarrow, databricks-sdk, databricks-sql-connector) are
+# preinstalled on Databricks Apps – no versions pinned so nothing gets upgraded.
+databricks-sql-connector
+databricks-sdk
+openpyxl
+xlsxwriter

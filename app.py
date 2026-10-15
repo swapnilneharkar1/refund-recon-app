@@ -14,6 +14,13 @@ from recon import ingest, reports
 from recon.config import Settings
 from recon.logic import BOUNCE_REMARKS, PENAL_REMARKS, Options, run_pipeline
 
+# Works on both older Streamlit (preinstalled on Databricks Apps) and newer versions.
+try:
+    _ver = tuple(int(x) for x in st.__version__.split(".")[:2])
+except Exception:  # noqa: BLE001
+    _ver = (1, 0)
+FULL = {"width": "stretch"} if _ver >= (1, 46) else {"use_container_width": True}
+
 st.set_page_config(page_title="Bounce & Penal Refund Recon", page_icon="📊", layout="wide")
 
 st.markdown("""
@@ -46,7 +53,7 @@ with st.sidebar:
     st.caption(f"Run history is kept in `{P}_run_log`.")
     if missing:
         st.error("Missing settings: " + ", ".join(missing) + ". Check app.yaml / the app's resources.")
-    if st.button("Test connection", width="stretch", disabled=bool(missing)):
+    if st.button("Test connection", **FULL, disabled=bool(missing)):
         try:
             from recon.backends import DatabricksBackend
             b = DatabricksBackend(settings)
@@ -155,7 +162,7 @@ def file_panel(col, side: str, label: str, spec: dict, hard: list[str]):
             for w in prep.warnings:
                 st.info(w)
             with st.expander("Preview (cleaned)"):
-                st.dataframe(prep.df.head(50), width="stretch", hide_index=True)
+                st.dataframe(prep.df.head(50), **FULL, hide_index=True)
         return up, prep
 
 
@@ -165,7 +172,7 @@ ops_up, ops_prep = file_panel(c2, "OPS", "2. OPS file", ingest.OPS_COLUMNS, inge
 
 ready = bool(ops_prep and ops_prep.ok and fin_prep and fin_prep.ok and not missing)
 st.divider()
-go = st.button("▶ Execute reconciliation", type="primary", disabled=not ready, width="stretch")
+go = st.button("▶ Execute reconciliation", type="primary", disabled=not ready, **FULL)
 if not ready:
     st.caption("Upload both files (1. Finance, 2. OPS) with all required columns to enable Execute.")
 
@@ -232,7 +239,7 @@ if "result" in st.session_state:
     dl = st.columns(3)
     for col, (kind, (label, fname, data)) in zip(dl, xlsx.items()):
         with col:
-            st.download_button(f"⬇ {label}", data, file_name=fname, type="primary", width="stretch",
+            st.download_button(f"⬇ {label}", data, file_name=fname, type="primary", **FULL,
                                key=f"dl_{kind}",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             st.caption(sheet_desc[kind])
@@ -255,7 +262,7 @@ if "result" in st.session_state:
                 if pick:
                     show = df[df["Remark Code"].isin([int(p.split(" – ")[0]) for p in pick])]
             st.caption(f"{len(show):,} rows")
-            st.dataframe(show, width="stretch", hide_index=True, height=420)
+            st.dataframe(show, **FULL, hide_index=True, height=420)
             if name != "Summary":
                 st.download_button(f"CSV – {name}", show.to_csv(index=False).encode("utf-8-sig"),
                                    file_name=f"{name.replace(' ', '_').replace('–', '')}_{result.run_id}.csv",

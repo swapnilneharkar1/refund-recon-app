@@ -1,23 +1,40 @@
 """Settings loader.
 
-Values are read (in order) from Streamlit secrets (.streamlit/secrets.toml) and
-then environment variables. Nothing secret is ever hard-coded in this repo.
+Values come from environment variables (app.yaml on Databricks Apps), or from Streamlit
+secrets (Streamlit Cloud "Secrets" box / local .streamlit/secrets.toml). Secrets are only read
+when they can exist – older Streamlit
+versions print a "No secrets found" error box whenever st.secrets is touched without one.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+
+def _secrets_file_exists() -> bool:
+    candidates = [Path.home() / ".streamlit" / "secrets.toml",
+                  Path.cwd() / ".streamlit" / "secrets.toml",
+                  Path(__file__).resolve().parent.parent / ".streamlit" / "secrets.toml"]
+    return any(p.is_file() for p in candidates)
+
+
+# Streamlit Community Cloud keeps app secrets (Settings -> Secrets) under /mount/src.
+_ON_STREAMLIT_CLOUD = os.path.isdir("/mount/src")
+_HAS_SECRETS = _secrets_file_exists() or _ON_STREAMLIT_CLOUD
 
 
 def _get(key: str, default: str | None = None) -> str | None:
-    try:
-        import streamlit as st
-
-        if key in st.secrets:
-            return str(st.secrets[key])
-    except Exception:  # no secrets file / not running under streamlit
-        pass
-    return os.environ.get(key, default)
+    if key in os.environ:
+        return os.environ[key]
+    if _HAS_SECRETS:
+        try:
+            import streamlit as st
+            if key in st.secrets:
+                return str(st.secrets[key])
+        except Exception:  # noqa: BLE001
+            pass
+    return default
 
 
 @dataclass

@@ -89,6 +89,30 @@ def _report_sheets(r: RunResult, kind: str) -> tuple[dict[str, pd.DataFrame], se
 
 def _write_workbook(r: RunResult, title_text: str, sheets: dict[str, pd.DataFrame],
                     summ: pd.DataFrame, info_extra: list[tuple[str, str]]) -> bytes:
+    try:
+        import xlsxwriter  # noqa: F401  (nicer formatting, faster)
+        return _write_xlsxwriter(r, title_text, sheets, summ, info_extra)
+    except ImportError:
+        return _write_openpyxl(r, title_text, sheets, summ, info_extra)
+
+
+def _split(df: pd.DataFrame):
+    return [df.iloc[i:i + EXCEL_MAX_ROWS] for i in range(0, max(len(df), 1), EXCEL_MAX_ROWS)]
+
+
+def _is_money(c: str) -> bool:
+    return any(k in c for k in ("Amount", "Difference", "PENAL_"))
+
+
+def _width(c: str) -> float:
+    if c == "REFERENCE":
+        return 24
+    if c in ("FINREFERENCE_SCHDATE", "Remarks"):
+        return 40
+    return min(max(12, len(str(c)) * 0.9), 45)
+
+
+def _write_xlsxwriter(r, title_text, sheets, summ, info_extra) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter", datetime_format="dd-mmm-yyyy",
                         date_format="dd-mmm-yyyy") as xw:
@@ -99,7 +123,6 @@ def _write_workbook(r: RunResult, title_text: str, sheets: dict[str, pd.DataFram
         title = wb.add_format({"bold": True, "font_size": 14})
         bold = wb.add_format({"bold": True})
 
-        # ---- Summary sheet
         ws = wb.add_worksheet("Summary")
         xw.sheets["Summary"] = ws
         ws.write(0, 0, f"Refund of Bounce and Penal for Excess Available Cases – {title_text}", title)
@@ -115,23 +138,58 @@ def _write_workbook(r: RunResult, title_text: str, sheets: dict[str, pd.DataFram
         ws.set_column(1, 2, 42)
         ws.set_column(3, 6, 18, money)
 
-        # ---- data sheets (split if over Excel's row limit)
         for name, df in sheets.items():
-            parts = [df.iloc[i:i + EXCEL_MAX_ROWS] for i in range(0, max(len(df), 1), EXCEL_MAX_ROWS)]
-            for n, part in enumerate(parts):
+            for n, part in enumerate(_split(df)):
                 sn = name if n == 0 else f"{name[:27]}_{n + 1}"
                 part.to_excel(xw, sheet_name=sn, index=False)
                 w = xw.sheets[sn]
                 for j, c in enumerate(part.columns):
                     w.write(0, j, c, hdr)
-                    is_money = any(k in c for k in ("Amount", "Difference", "PENAL_"))
-                    width = min(max(12, len(str(c)) * 0.9), 45)
-                    if c in ("REFERENCE", "FINREFERENCE_SCHDATE", "Remarks"):
-                        width = 24 if c == "REFERENCE" else 40
-                    w.set_column(j, j, width, money if is_money else None)
+                    w.set_column(j, j, _width(c), money if _is_money(c) else None)
                 w.set_row(0, 45)
                 w.freeze_panes(1, 0)
                 w.autofilter(0, 0, max(len(part), 1), len(part.columns) - 1)
+    return buf.getvalue()
+
+
+def _write_openpyxl(r, title_text, sheets, summ, info_extra) -> bytes:
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    hdr_font, hdr_fill = Font(bold=True, color="FFFFFF"), PatternFill("solid", fgColor="1F3864")
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl", datetime_format="DD-MMM-YYYY",
+                        date_format="DD-MMM-YYYY") as xw:
+        info = [("Run ID", r.run_id), ("Run by", r.stats.get("user", ""))] + info_extra
+        start = len(info) + 4
+        summ.to_excel(xw, sheet_name="Summary", startrow=start, index=False)
+        ws = xw.sheets["Summary"]
+        ws.cell(1, 1, f"Refund of Bounce and Penal for Excess Available Cases – {title_text}").font = Font(bold=True, size=14)
+        for i, (k, v) in enumerate(info, start=3):
+            ws.cell(i, 1, k).font = Font(bold=True)
+            ws.cell(i, 2, v)
+        for j in range(1, len(summ.columns) + 1):
+            c = ws.cell(start + 1, j)
+            c.font, c.fill = hdr_font, hdr_fill
+        for col, wdt in (("A", 34), ("B", 42), ("C", 42), ("D", 18), ("E", 18), ("F", 18), ("G", 18)):
+            ws.column_dimensions[col].width = wdt
+
+        for name, df in sheets.items():
+            for n, part in enumerate(_split(df)):
+                sn = name if n == 0 else f"{name[:27]}_{n + 1}"
+                part.to_excel(xw, sheet_name=sn, index=False)
+                w = xw.sheets[sn]
+                for j, c in enumerate(part.columns, start=1):
+                    cell = w.cell(1, j)
+                    cell.font, cell.fill = hdr_font, hdr_fill
+                    cell.alignment = Alignment(wrap_text=True, vertical="center")
+                    letter = get_column_letter(j)
+                    w.column_dimensions[letter].width = _width(c)
+                    if _is_money(c):
+                        for row in w.iter_rows(min_row=2, min_col=j, max_col=j):
+                            row[0].number_format = "#,##0.00"
+                w.freeze_panes = "A2"
+                w.auto_filter.ref = w.dimensions
     return buf.getvalue()
 
 
