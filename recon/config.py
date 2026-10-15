@@ -77,13 +77,32 @@ class Settings:
             # ARM_* first: inside a Databricks App, DATABRICKS_CLIENT_* belong to the app's own
             # principal, while ARM_* are used when the app should run as RPADLAKEFLOW-PROD.
             client_id=_get("ARM_CLIENT_ID") or _get("DATABRICKS_CLIENT_ID"),
-            client_secret=_get("ARM_CLIENT_SECRET") or _get("DATABRICKS_CLIENT_SECRET"),
+            client_secret=((_get("ARM_CLIENT_SECRET") or _get("DATABRICKS_CLIENT_SECRET") or "").strip()
+                           or None),
             tenant_id=_get("ARM_TENANT_ID") or _get("DATABRICKS_TENANT_ID"),
             catalog=_get("RECON_CATALOG", "bfl_std_lake") or "bfl_std_lake",
             schema=_get("RECON_SCHEMA", "financerpa") or "financerpa",
             volume=_get("RECON_VOLUME", "recon_uploads"),
             table_prefix=_get("RECON_TABLE_PREFIX", "bp_refund") or "bp_refund",
         )
+
+    def describe_secret(self) -> str:
+        """What kind of secret was supplied – never reveals the secret itself."""
+        import re
+        v = self.client_secret or ""
+        if not v:
+            return "No client secret found in the app settings."
+        if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", v):
+            return ("The secret looks like a GUID – that is the Azure **Secret ID**, not the secret **Value**. "
+                    "Use the Value column from Certificates & secrets.")
+        if v.lower().startswith("dose"):
+            hint = "" if self.auth_type == "databricks" else (
+                " Set `DATABRICKS_AUTH_TYPE = \"databricks\"` in the secrets so it is sent to Databricks, not Azure.")
+            return f"The secret is a **Databricks** OAuth secret (starts with `dose`, {len(v)} characters).{hint}"
+        kind = "an Azure client secret Value" if "~" in v else "an unrecognised format"
+        return (f"The secret looks like {kind} ({len(v)} characters). If Azure still rejects it, check it was "
+                f"created under Application ID {self.client_id}, is not expired, and the app was rebooted after "
+                f"saving the secrets.")
 
     def missing_for_databricks(self) -> list[str]:
         missing = []
