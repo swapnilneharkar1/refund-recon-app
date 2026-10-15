@@ -54,14 +54,12 @@ with st.sidebar:
     if missing:
         st.error("Missing settings: " + ", ".join(missing) + ". Check app.yaml / the app's resources.")
     if st.button("Test connection", **FULL, disabled=bool(missing)):
-        try:
-            from recon.backends import DatabricksBackend
-            b = DatabricksBackend(settings)
-            who = b.whoami()
-            b.close()
-            st.success(f"Connected as {who}")
-        except Exception as e:  # noqa: BLE001
-            st.error(f"Connection failed: {e}")
+        from recon.backends import diagnose
+        with st.spinner("Checking step by step…"):
+            steps = diagnose(settings)
+        for name, ok, detail in steps:
+            (st.success if ok else st.error)(f"**{name}** – {detail}")
+        if steps and not steps[-1][1]:
             st.info(settings.describe_secret())
 
     st.divider()
