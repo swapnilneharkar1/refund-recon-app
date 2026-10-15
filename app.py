@@ -62,6 +62,7 @@ with st.sidebar:
             st.success(f"Connected as {who}")
         except Exception as e:  # noqa: BLE001
             st.error(f"Connection failed: {e}")
+            st.info(settings.describe_secret())
 
     st.divider()
     st.caption("Reconciliation options")
